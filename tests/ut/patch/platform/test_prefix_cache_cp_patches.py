@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_planning import _max_memory_usage_bytes_from_groups
 from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     generate_scheduler_kv_cache_config,
@@ -922,7 +923,8 @@ def test_builder_routes_deepseek_v4_groups_to_shared_tuple_planner(monkeypatch) 
     assert result.kv_transfer_config is None
 
     builder = AscendKVCacheConfigBuilder()
-    needed_memory = builder._get_max_memory_usage_bytes_from_groups(
+    needed_memory = _max_memory_usage_bytes_from_groups(
+        builder,
         vllm_config,
         kv_cache_config.kv_cache_groups,
     )

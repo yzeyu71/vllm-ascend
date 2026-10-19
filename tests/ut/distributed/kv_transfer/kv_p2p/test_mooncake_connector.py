@@ -19,7 +19,7 @@ import zmq
 from vllm.config import KVTransferConfig
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
-from vllm.v1.core.kv_cache_planning import _is_kv_cache_spec_uniform
+from vllm.v1.core.kv_cache_planning import is_kv_cache_spec_uniform
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -397,7 +397,7 @@ class TestMooncakeTransferGroups(unittest.TestCase):
             main_layer: main_spec,
             index_layer: index_spec,
         }
-        self.assertFalse(_is_kv_cache_spec_uniform(layer_specs))
+        self.assertFalse(is_kv_cache_spec_uniform(layer_specs))
         uniform_spec = UniformTypeKVCacheSpecs(
             block_size=128,
             kv_cache_specs=layer_specs,

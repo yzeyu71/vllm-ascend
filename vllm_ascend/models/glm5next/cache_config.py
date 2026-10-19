@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.v1.core.kv_cache_planning import _create_kv_cache_group_specs
+from vllm.v1.core.kv_cache_planning import create_kv_cache_group_specs
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -333,7 +333,7 @@ def _create_mamba_groups(
     grouped_layer_names: list[list[str]],
 ) -> list[KVCacheGroupSpec]:
     sorted_groups = [list(_sorted_layer_names(layer_names)) for layer_names in grouped_layer_names]
-    return _create_kv_cache_group_specs(mamba_specs, sorted_groups)
+    return create_kv_cache_group_specs(mamba_specs, sorted_groups)
 
 
 def get_glm5_next_kv_cache_groups(

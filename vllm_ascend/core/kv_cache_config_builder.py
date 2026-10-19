@@ -18,9 +18,9 @@ from vllm.v1.core.kv_cache_planning import (
     DefaultKVCacheConfigBuilder,
     _annotate_eagle_groups,
     _approximate_gcd,
-    _unify_hybrid_kv_cache_specs,
     _uses_trailing_mtp_layers,
     _warn_if_unannotated_eagle_mamba,
+    unify_hybrid_kv_cache_specs,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -45,7 +45,6 @@ from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
     get_glm5_next_kv_cache_config,
     get_glm5_next_kv_cache_groups,
-    get_glm5_next_max_memory_usage,
     get_glm5_next_pool_bytes_per_block,
 )
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
@@ -72,7 +71,7 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
             # vLLM's generic grouping promotes local-attention specs before it
             # groups, so the Ascend layouts must see the same promoted specs.
-            _unify_hybrid_kv_cache_specs(kv_cache_spec)
+            unify_hybrid_kv_cache_specs(kv_cache_spec)
 
         if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
             return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
@@ -168,22 +167,6 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         if _is_deepseek_v4_groups(kv_cache_groups):
             return _deepseek_v4_pool_bytes_per_block(kv_cache_groups)
         return super()._get_pool_bytes_per_block(vllm_config, kv_cache_groups)
-
-    def _get_max_memory_usage_bytes_from_groups(
-        self,
-        vllm_config: VllmConfig,
-        kv_cache_groups: list[KVCacheGroupSpec],
-    ) -> int:
-        """Only GLM-Next needs a custom admission formula.
-
-        The default formula (``pool bytes per block x requested blocks``) is
-        exact for every other Ascend layout once
-        :meth:`_get_pool_bytes_per_block` is overridden, because those layouts
-        are uniform-type groups charged once per requested page.
-        """
-        if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
-            return get_glm5_next_max_memory_usage(vllm_config, kv_cache_groups)
-        return super()._get_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
 
 
 def _get_ascend_grouped_groups(

@@ -55,7 +55,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
-from vllm.v1.core.kv_cache_planning import _unify_hybrid_kv_cache_specs
+from vllm.v1.core.kv_cache_planning import unify_hybrid_kv_cache_specs
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -1196,7 +1196,7 @@ class NPUWorker(WorkerBase):
                 # Use the same full-allocation specs for KVPP budgeting and
                 # the engine's cache groups. Attention compute stays windowed.
                 kv_cache_spec = dict(kv_cache_spec)
-                _unify_hybrid_kv_cache_specs(kv_cache_spec)
+                unify_hybrid_kv_cache_specs(kv_cache_spec)
             kvpp_rank = (
                 get_pcp_group().rank_in_group * self.vllm_config.parallel_config.tensor_parallel_size
                 + get_tp_group().rank_in_group

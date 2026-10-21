@@ -28,15 +28,9 @@ from vllm_ascend.utils import vllm_version_is
 # vLLM #61183 moved these helpers to `kv_cache_planning` on main; the v0.31.0
 # lane still ships them in `kv_cache_utils`.
 if vllm_version_is("0.31.0"):
-    from vllm.v1.core.kv_cache_utils import (
-        create_kv_cache_group_specs,
-        may_override_num_blocks,
-    )
+    from vllm.v1.core.kv_cache_utils import create_kv_cache_group_specs
 else:
-    from vllm.v1.core.kv_cache_planning import (
-        create_kv_cache_group_specs,
-        may_override_num_blocks,
-    )
+    from vllm.v1.core.kv_cache_planning import create_kv_cache_group_specs
 
 
 @dataclass(frozen=True)

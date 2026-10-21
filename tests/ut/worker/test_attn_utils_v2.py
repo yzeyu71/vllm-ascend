@@ -43,7 +43,7 @@ from vllm_ascend.attention.dsa_v1 import (
     AscendDSASWABackend,
 )
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
-from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadataBuilder
+from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAImpl, AscendSFAMetadataBuilder
 from vllm_ascend.core.kv_cache_config_builder import (
     _get_kv_cache_config_deepseek_v4_main,
 )
@@ -57,6 +57,8 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware
 from vllm_ascend.models.deepseek_v4 import compressor as deepseek_v4_compressor
 from vllm_ascend.models.deepseek_v4 import indexer as deepseek_v4_indexer
 from vllm_ascend.models.deepseek_v4 import model as deepseek_v4_model
+from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.worker.utils import prepare_ascend_kernel_block_sizes
 from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2 import model_runner as v2_model_runner
 from vllm_ascend.worker.v2 import utils as v2_utils
@@ -496,7 +498,7 @@ def test_mrv2_attention_views_interleave_kv_per_physical_page():
 
 
 @pytest.mark.parametrize("connector", ["MooncakeConnectorV2", "MooncakePullConnector"])
-def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(monkeypatch, connector):
+def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatch, connector):
     layer_name = "model.layers.0.self_attn.attn"
     num_blocks = 2
     spec = AscendMLAAttentionSpec(
@@ -515,6 +517,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(
         fa_quant_layer=False,
         supports_prolog_v3_writer=lambda: False,
         supports_strided_mla_writer=lambda: True,
+        use_flashmla=True,
     )
     backend = MagicMock()
     backend.get_kv_cache_shape.side_effect = lambda num_block_ids, block_size, num_kv_heads, head_size, *_args: (
@@ -528,6 +531,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(
     vllm_config = SimpleNamespace(
         additional_config={},
         cache_config=SimpleNamespace(cache_dtype="auto"),
+        compilation_config=SimpleNamespace(static_forward_context={layer_name: attn_module}),
         kv_transfer_config=None,
         model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         quant_config=None,
@@ -580,7 +584,6 @@ def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(
         )[layer_name]
 
     monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: flash_profile)
-    monkeypatch.setattr(attn_utils, "get_flashmla_ops", lambda: (MagicMock(), MagicMock()))
     for q_heads in (8, 12, 64, 96):
         spec = replace(spec, num_heads=q_heads)
         fused = reshape()
@@ -588,23 +591,24 @@ def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(
         assert fused.shape == (6, 128, 1, 576)
         assert fused.stride() == (81408, 576, 576, 1)
 
-    # Even on A5, FlashMLA-incompatible query-head counts use the
-    # FIA-compatible component-major layout.
+    # The resolved backend rejects unsupported query-head counts before cache
+    # allocation, so FIA receives the component-major view even on A5.
     spec = replace(spec, num_heads=48)
+    attn_module.impl.use_flashmla = False
     a5_fallback = reshape()
     assert isinstance(a5_fallback, tuple)
 
     # Missing FlashMLA APIs in the active CANN package also select the
     # FIA-compatible component-major layout.
-    monkeypatch.setattr(attn_utils, "get_flashmla_ops", lambda: None)
+    # Backend selection has already resolved missing operator APIs to FIA.
+    attn_module.impl.use_flashmla = False
     spec = replace(spec, num_heads=64)
     missing_flashmla_ops = reshape()
     assert isinstance(missing_flashmla_ops, tuple)
 
-    # Raw MooncakeV2 slots carry no physical-layout metadata. All PD endpoints
-    # therefore use component-major storage, even when local FlashMLA support
-    # would otherwise select token-fused.
-    monkeypatch.setattr(attn_utils, "get_flashmla_ops", lambda: (MagicMock(), MagicMock()))
+    # Preserve the external reader's token-fused PD contract. Native FIA
+    # still receives component-major pages when FlashMLA is not selected.
+    attn_module.impl.use_flashmla = True
     vllm_config.kv_transfer_config = SimpleNamespace(
         kv_connector=connector,
         kv_connector_module_path=None,
@@ -614,16 +618,15 @@ def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(
         },
     )
     unequal_pd_cache = reshape()
-    assert isinstance(unequal_pd_cache, tuple)
-    unequal_pd_nope, unequal_pd_rope = unequal_pd_cache
-    assert unequal_pd_nope.shape == (6, 128, 1, 512)
-    assert unequal_pd_nope.stride() == (81408, 512, 512, 1)
-    assert unequal_pd_rope.storage_offset() - unequal_pd_nope.storage_offset() == 65536
+    assert isinstance(unequal_pd_cache, torch.Tensor)
+    assert unequal_pd_cache.shape == (6, 128, 1, 576)
+    assert unequal_pd_cache.stride() == (81408, 576, 576, 1)
 
     vllm_config.kv_transfer_config.kv_connector_extra_config["decode"]["tp_size"] = 2
     equal_pd_cache = reshape()
-    assert isinstance(equal_pd_cache, tuple)
+    assert isinstance(equal_pd_cache, torch.Tensor)
     vllm_config.kv_transfer_config = None
+    attn_module.impl.use_flashmla = False
 
     monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: component_profile)
     cache = reshape()
@@ -768,7 +771,17 @@ def test_v2_zeroer_constructs_component_zeroers(monkeypatch):
 
     assert len(RecordingZeroer.calls) == 2
     assert all(call["kernel_block_sizes"] == [4] for call in RecordingZeroer.calls)
-    assert all(call["attn_groups"] == [group] for call in RecordingZeroer.calls)
+    for call in RecordingZeroer.calls:
+        [component_group] = call["attn_groups"]
+        if vllm_version_is("0.31.0"):
+            assert component_group == group
+        else:
+            # vLLM main made AttentionGroup identity-comparable, so match on
+            # the fields the zeroer preserves.
+            assert component_group.backend is group.backend
+            assert component_group.layer_names == group.layer_names
+            assert component_group.kv_cache_spec == group.kv_cache_spec
+            assert component_group.kv_cache_group_id == group.kv_cache_group_id
     for component_id, call in enumerate(RecordingZeroer.calls):
         assert call["static_forward_context"] == {
             "layer": SimpleNamespace(kv_cache=context["layer"].kv_cache[component_id])
@@ -916,6 +929,13 @@ def test_v2_zeroer_skips_static_v_scale_for_mxfp8(monkeypatch):
             return launch
 
     monkeypatch.setattr("vllm.v1.worker.utils._zero_kv_blocks_kernel", _CpuZeroKernel())
+    if not vllm_version_is("0.31.0"):
+        # vLLM #60766 made async_tensor_h2d resolve pin memory lazily through
+        # is_pin_memory_available(). The NPU platform advertises pinned-memory
+        # support, so this CPU runner would allocate a PrivateUse1-pinned tensor
+        # and fail. The release lane captures PIN_MEMORY at import (False here),
+        # so only the main lane needs the resolver disabled.
+        monkeypatch.setattr("vllm.utils.torch_utils.is_pin_memory_available", lambda: False)
     zeroer.zero_block_ids([0])
 
     # Block 0 payload: k, k_scale and v are cleared, v_scale is preserved.
@@ -1104,6 +1124,54 @@ def test_gqa_pcp_dcp_cache_keeps_tp_local_kv_heads(monkeypatch, dcp_size):
     specs = attn_utils.get_kv_cache_spec(vllm_config)
 
     assert specs["model.layers.0.self_attn.attn"].num_kv_heads == 1
+
+
+@pytest.mark.parametrize("is_draft_layer", [True, False])
+def test_draft_layer_specs_are_tagged_for_eagle_groups(monkeypatch, is_draft_layer):
+    """Draft specs carry ``is_draft`` so EAGLE groups get flagged on main.
+
+    vLLM #42309 annotates ``is_eagle_group`` from ``spec.is_draft``; without the
+    tag no group is recognised as the draft model's and the coordinator
+    fallback flags every target group as an EAGLE group.
+    """
+    source_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    if not hasattr(source_spec, "is_draft"):
+        pytest.skip("vLLM release lane has no KVCacheSpec.is_draft")
+    layer = SimpleNamespace(
+        kv_sharing_target_layer_name=None,
+        align_kv_cache_with_mamba=True,
+        is_draft_layer=is_draft_layer,
+        get_kv_cache_spec=lambda _config: source_spec,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            use_mla=False,
+            dtype=torch.bfloat16,
+            get_total_num_kv_heads=lambda: 4,
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        attention_config=SimpleNamespace(indexer_kv_dtype="auto"),
+        cache_config=SimpleNamespace(cache_dtype="auto", block_size=128),
+    )
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"model.layers.0.self_attn.attn": layer},
+    )
+    monkeypatch.setattr(attn_utils, "enable_sfa_dcp_replicated_indexer", lambda _config: False)
+
+    spec = attn_utils.get_kv_cache_spec(vllm_config)["model.layers.0.self_attn.attn"]
+
+    assert spec.is_draft is is_draft_layer
 
 
 @pytest.mark.parametrize(
@@ -1597,6 +1665,7 @@ def test_v2_fused_offload_splits_target_and_draft_metadata_in_one_sfa_group(for_
 
 def test_v2_fused_offload_prepares_request_ownership_and_restores_tails(monkeypatch):
     state = AscendModelState.__new__(AscendModelState)
+    state.decoder_replay = None
     state.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
         cache_config=SimpleNamespace(block_size=128),
@@ -1807,6 +1876,50 @@ def test_prepare_kernel_block_sizes_uses_logical_size_for_dsv4():
     assert upstream_attn_utils.prepare_kernel_block_sizes(kv_cache_config, attn_groups) == [spec.block_size]
 
 
+def test_prepare_ascend_kernel_block_sizes_splits_alias_layouts():
+    """Layerwise alias layouts must keep their kernel block split (#57169)."""
+    spec = _make_dsv4_mla_spec(256, 4)
+    layer_names = ["model.layers.0.self_attn"]
+    attn_groups = [
+        [
+            AttentionGroup(
+                backend=AscendSFABackend,
+                layer_names=layer_names,
+                kv_cache_spec=spec,
+                kv_cache_group_id=0,
+            )
+        ]
+    ]
+    page_bytes = 4096
+
+    def selected_kernel_block_sizes(layer_stride: int, block_stride: int) -> list[int]:
+        kv_cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=2 * page_bytes,
+                    layers=layer_names,
+                    layer_stride=layer_stride,
+                    block_stride=block_stride,
+                )
+            ],
+            kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)],
+        )
+        return prepare_ascend_kernel_block_sizes(kv_cache_config, attn_groups)
+
+    # Layerwise reuse aliases the layers inside one physical slot
+    # (`layer_stride == 0`) while the pages stay dense, so SFA still gets its
+    # 128-token kernel blocks instead of the 256-token manager block.
+    assert selected_kernel_block_sizes(layer_stride=0, block_stride=page_bytes) == [128]
+    if vllm_version_is("0.31.0"):
+        # The release lane has no packing heuristic and always splits.
+        assert selected_kernel_block_sizes(layer_stride=page_bytes, block_stride=2 * page_bytes) == [128]
+    else:
+        # Block-outermost packing interleaves the layers' pages between blocks,
+        # which no split can address, so #57169 keeps the manager block size.
+        assert selected_kernel_block_sizes(layer_stride=page_bytes, block_stride=2 * page_bytes) == [spec.block_size]
+
+
 @pytest.mark.parametrize(
     ("device_type", "expected_c128_state_sizes"),
     [
@@ -1916,6 +2029,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
         )
     else:
         model_state = AscendModelState.__new__(AscendModelState)
+        model_state.decoder_replay = None
         # vLLM 0.31 (#58149) exposes max_model_len as a read-only property backed by
         # model_config.
         model_state.model_config = SimpleNamespace(max_model_len=8)

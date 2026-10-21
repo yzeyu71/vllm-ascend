@@ -72,7 +72,6 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as VllmDeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec
@@ -97,6 +96,7 @@ from vllm_ascend.utils import (
     enable_dsa_cp,
     extract_dsv4_layer_index,
     get_dsv4_compress_ratio,
+    vllm_version_is,
 )
 from vllm_ascend.worker.v2.pp_transport import (
     PPTransportDataType,
@@ -106,6 +106,25 @@ from vllm_ascend.worker.v2.pp_transport import (
 from vllm_ascend.worker.v2.pp_transport import (
     make_empty_intermediate_tensors as make_pp_empty_intermediate_tensors,
 )
+
+# vLLM #61392 switched DeepseekV4Config to the upstream Transformers class on
+# main; the v0.31.0 lane still ships it under
+# `vllm.transformers_utils.configs.deepseek_v4`.
+if vllm_version_is("0.31.0"):
+    from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config  # type: ignore[import-not-found]
+else:
+    from transformers import DeepseekV4Config
+
+# vLLM #61392 folds the legacy `compress_ratios` / `num_hash_layers` fields of
+# the upstream DeepseekV4Config into `layer_types` / `mlp_layer_types`; the
+# Ascend helpers and the KV-store metadata still read the legacy
+# `compress_ratios` list, which `DeepseekV4DecoderLayer` restores on main.
+_DSV4_COMPRESS_RATIO_BY_LAYER_TYPE = {
+    "sliding_attention": 0,
+    "compressed_sparse_attention": 4,
+    "heavily_compressed_attention": 128,
+}
+
 
 sequence_parallel_chunk = sp_shard
 
@@ -330,7 +349,14 @@ class DeepseekV4MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        self.hash = layer_idx < config.num_hash_layers and not is_draft_layer
+        # vLLM main folded `num_hash_layers` into `mlp_layer_types`; keep
+        # honoring the legacy attribute when it is still present.
+        num_hash_layers = getattr(config, "num_hash_layers", None)
+        if num_hash_layers is None:
+            num_hash_layers = sum(
+                1 for layer_type in (getattr(config, "mlp_layer_types", None) or []) if layer_type == "hash_moe"
+            )
+        self.hash = layer_idx < num_hash_layers and not is_draft_layer
         self.gate.bias_vl = None
         if getattr(config, "vision_n_layers", 0) > 0:
             self.gate.bias_vl = nn.Parameter(
@@ -547,7 +573,21 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{prefix}.wo_b",
             return_bias=False,
         )
-        self.compress_ratio = get_dsv4_compress_ratio(config, config_layer_idx)
+        if vllm_version_is("0.31.0"):
+            self.compress_ratio = get_dsv4_compress_ratio(config, config_layer_idx)
+        else:
+            # vLLM #61392 folded the legacy `compress_ratios` list into
+            # `layer_types`; keep reading the legacy field when it is present.
+            compress_ratios = getattr(config, "compress_ratios", None)
+            if compress_ratios is not None:
+                self.compress_ratio = (
+                    compress_ratios[config_layer_idx] if config_layer_idx < len(compress_ratios) else 0
+                )
+            else:
+                layer_types = getattr(config, "layer_types", None) or []
+                self.compress_ratio = _DSV4_COMPRESS_RATIO_BY_LAYER_TYPE.get(
+                    layer_types[config_layer_idx] if config_layer_idx < len(layer_types) else "", 0
+                )
 
         if self.compress_ratio > 1:
             rope_theta = config.compress_rope_theta
@@ -555,6 +595,13 @@ class DeepseekV4Attention(nn.Module):
         else:
             rope_theta = config.rope_theta
             rope_groups = ["default"]
+        # vLLM #61392 keys the checkpoint's YaRN values under the compressor
+        # (CSA/HCA) group; the v0.31.0 lane keeps a single flat dict.
+        yarn_rope_parameters = config.rope_parameters
+        if not vllm_version_is("0.31.0"):
+            compress_rope_parameters = yarn_rope_parameters.get("compress")
+            if isinstance(compress_rope_parameters, dict):
+                yarn_rope_parameters = compress_rope_parameters
         self.rotary_emb = ComplexExpRotaryEmbedding(
             vllm_config=vllm_config,
             layername=f"{prefix}.attn",
@@ -562,10 +609,10 @@ class DeepseekV4Attention(nn.Module):
             rotary_dim=self.rope_head_dim,
             max_position_embeddings=max_position_embeddings,
             is_neox_style=False,
-            scaling_factor=config.rope_parameters["factor"],
+            scaling_factor=yarn_rope_parameters.get("factor", 1.0),
             base=rope_theta,
-            beta_fast=config.rope_parameters["beta_fast"],
-            beta_slow=config.rope_parameters["beta_slow"],
+            beta_fast=yarn_rope_parameters.get("beta_fast", 32),
+            beta_slow=yarn_rope_parameters.get("beta_slow", 1),
             rope_groups=rope_groups,
         )
 
@@ -681,12 +728,34 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if config is None:
             config = vllm_config.model_config.hf_config
+        if not vllm_version_is("0.31.0"):
+            # vLLM #61392 folded `compress_ratios` / `num_hash_layers` into
+            # `layer_types` / `mlp_layer_types`; the Ascend helpers and the
+            # KV-store metadata still index the legacy fields, so restore them.
+            if getattr(config, "compress_ratios", None) is None:
+                config.compress_ratios = [
+                    _DSV4_COMPRESS_RATIO_BY_LAYER_TYPE.get(layer_type, 0)
+                    for layer_type in (getattr(config, "layer_types", None) or [])
+                ]
+            if getattr(config, "num_hash_layers", None) is None:
+                config.num_hash_layers = sum(
+                    1 for layer_type in (getattr(config, "mlp_layer_types", None) or []) if layer_type == "hash_moe"
+                )
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
         self.hidden_size = config.hidden_size
-        max_position_embeddings = config.rope_parameters["original_max_position_embeddings"]
+        # vLLM #61392 keys the checkpoint's YaRN values under the compressor
+        # (CSA/HCA) group; the v0.31.0 lane keeps a single flat dict.
+        yarn_rope_parameters = config.rope_parameters
+        if not vllm_version_is("0.31.0"):
+            compress_rope_parameters = yarn_rope_parameters.get("compress")
+            if isinstance(compress_rope_parameters, dict):
+                yarn_rope_parameters = compress_rope_parameters
+        max_position_embeddings = yarn_rope_parameters.get(
+            "original_max_position_embeddings", config.max_position_embeddings
+        )
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         layer_idx = int(prefix.split(sep=".")[-1])

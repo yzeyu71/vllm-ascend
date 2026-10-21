@@ -24,12 +24,14 @@ from contextlib import AbstractContextManager, nullcontext
 from fnmatch import filter as fnmatch_filter
 from types import NoneType
 from typing import Any
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 import torch_npu
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
+from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, get_pcp_group, init_distributed_environment
 from vllm.distributed.ec_transfer import (
@@ -55,7 +57,6 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
-from vllm.v1.core.kv_cache_planning import unify_hybrid_kv_cache_specs
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -110,10 +111,19 @@ from vllm_ascend.utils import (
     enable_custom_op,
     enable_sp,
     register_ascend_customop,
+    register_ascend_fla_customop,
     register_device_print,
     setup_ascend_local_comm_res,
+    vllm_version_is,
 )
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+# vLLM #61183 moved this KV-cache planning helper to `kv_cache_planning` on
+# main; the v0.31.0 lane still ships it in `kv_cache_utils`.
+if vllm_version_is("0.31.0"):
+    from vllm.v1.core.kv_cache_utils import unify_hybrid_kv_cache_specs
+else:
+    from vllm.v1.core.kv_cache_planning import unify_hybrid_kv_cache_specs
+
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -125,6 +135,21 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+
+# if true, allow tensor initialization and casting with internal format (e.g., NZ)
+torch.npu.config.allow_internal_format = True
+
+
+class _V1ModelRunnerFactory:
+    """Import the V1 model runner only when one is actually constructed."""
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+
+        return NPUModelRunner(*args, **kwargs)
+
+
+NPUModelRunner = _V1ModelRunnerFactory()
 
 
 class NPUWorker(WorkerBase):
@@ -546,6 +571,11 @@ class NPUWorker(WorkerBase):
         # in ray scenario. see https://github.com/vllm-project/vllm/pull/26845
         # for more details
         self.device = self._init_device()
+        # FLA import-time capability queries must run on the selected worker
+        # device, and registration must finish before any model is constructed.
+        # TODO: Drop this separate call when supported vLLM FLA or Triton Ascend
+        # versions fix import-time NPU init and general registration is restored.
+        register_ascend_fla_customop()
         # Initialize workspace manager
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
@@ -627,11 +657,14 @@ class NPUWorker(WorkerBase):
 
         maybe_apply_startup_plan(self)
 
+        randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and self.parallel_config.data_parallel_size > 1
+
         # Fast path: user has explicitly specified KV cache size via
         # --kv-cache-memory. Still run profile_run() to compile the model,
         # but skip the memory profiling calculation entirely.
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            self.model_runner.profile_run()
+            with set_current_vllm_config(self.vllm_config):
+                self.model_runner.profile_run(randomize_inputs=randomize_inputs)
             logger.info(
                 "Initial free memory %.2f GiB, reserved %.2f GiB for KV Cache "
                 "as specified by kv_cache_memory_bytes, skipping memory profiling. "
@@ -649,11 +682,14 @@ class NPUWorker(WorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
-        with memory_profiling(
-            self.init_snapshot,
-            weights_memory=int(self.model_runner.model_memory_usage),
-        ) as profile_result:
-            self.model_runner.profile_run()
+        with (
+            memory_profiling(
+                self.init_snapshot,
+                weights_memory=int(self.model_runner.model_memory_usage),
+            ) as profile_result,
+            set_current_vllm_config(self.vllm_config),
+        ):
+            self.model_runner.profile_run(randomize_inputs=randomize_inputs)
 
             # Record torch peak INSIDE the context and BEFORE graph capture,
             # so that graph pool allocations don't inflate the activation peak.
@@ -903,11 +939,20 @@ class NPUWorker(WorkerBase):
             assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
             context = allocator.use_memory_pool(tag="weights")
         else:
-            from contextlib import nullcontext
-
             context = nullcontext()  # type: ignore
 
-        with context, set_current_vllm_config(self.vllm_config):
+        # vLLM #57516 reclaims cached memory inside `load_model` via
+        # `torch.accelerator.empty_cache()`. Inside the sleep-mode pluggable
+        # memory pool `torch.npu.empty_cache()` trips "captures_underway.empty()",
+        # so on main neutralize it while weights load; the pool is reclaimed by
+        # sleep()/wake_up(). The v0.31.0 lane does not reclaim inside load_model.
+        empty_cache_context: AbstractContextManager[Any]
+        if self.vllm_config.model_config.enable_sleep_mode and not vllm_version_is("0.31.0"):
+            empty_cache_context = patch("torch.npu.empty_cache", lambda: None)
+        else:
+            empty_cache_context = nullcontext()
+
+        with context, empty_cache_context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
         if getattr(self, "use_v2_model_runner", False) and has_ec_transfer():
@@ -1351,7 +1396,9 @@ class NPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         self.log_memory_stats()
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        self.model_runner._dummy_run(num_tokens, uniform_decode=True, skip_gdn_state_update=True)
+        # Idle DP worker RPCs also need the current config for replay metadata.
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner._dummy_run(num_tokens, uniform_decode=True, skip_gdn_state_update=True)
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""

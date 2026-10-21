@@ -52,6 +52,12 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _ascend_resolve_kv_cache_block_sizes,
 )
 from vllm_ascend.patch.platform.patch_mamba_manager import AscendMambaManager
+from vllm_ascend.utils import vllm_version_is
+
+# vLLM #60043 removed the leftover `mamba_cache_mode="all"` path and now asserts
+# that prefix caching requires `mamba_cache_mode="align"`; the v0.31.0 lane still
+# allowed `"none"` together with `enable_caching=True`.
+_MAMBA_CACHING_MODE = "none" if vllm_version_is("0.31.0") else "align"
 
 
 def test_packed_cache_reuses_global_capacity_and_records_recycled_state_pages():
@@ -1319,7 +1325,7 @@ def test_ascend_mamba_manager_uses_logical_block_size_with_prefix_caching() -> N
         block_size=16,
         shapes=((1,),),
         dtypes=(torch.float32,),
-        mamba_cache_mode="none",
+        mamba_cache_mode=_MAMBA_CACHING_MODE,
     )
     block_pool = BlockPool(
         10,

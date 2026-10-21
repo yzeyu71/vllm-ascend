@@ -16,10 +16,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_planning import (
     DefaultKVCacheConfigBuilder,
-    _annotate_eagle_groups,
     _approximate_gcd,
-    _uses_trailing_mtp_layers,
-    _warn_if_unannotated_eagle_mamba,
     unify_hybrid_kv_cache_specs,
 )
 from vllm.v1.kv_cache_interface import (
@@ -76,7 +73,7 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
             return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
 
-        grouped_groups = _get_ascend_grouped_groups(vllm_config, kv_cache_spec)
+        grouped_groups = _get_ascend_grouped_groups(kv_cache_spec)
         if grouped_groups is not None:
             return grouped_groups
 
@@ -170,7 +167,6 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
 
 
 def _get_ascend_grouped_groups(
-    vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
     """Group DSV4.1 or mixed C4/C128/SWA-MLA layers into shared slots.
@@ -188,13 +184,6 @@ def _get_ascend_grouped_groups(
             return None
         groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
 
-    _annotate_eagle_groups(
-        vllm_config,
-        kv_cache_spec,
-        groups,
-        use_trailing_layer_fallback=_uses_trailing_mtp_layers(vllm_config),
-    )
-    _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
 

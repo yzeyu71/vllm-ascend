@@ -158,9 +158,10 @@ def test_prefix_lookup_rechecks_after_save_and_eviction_instead_of_using_hit_ttl
 
 @pytest.mark.parametrize("draft_first", [False, True])
 def test_joint_prefix_group_ownership_survives_scheduler_conversion_and_empty_pp_layer_names(draft_first):
+    from vllm.v1.core.kv_cache_planning import DefaultKVCacheConfigBuilder
     from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
 
-    from vllm_ascend.patch.platform import patch_kv_cache_utils
+    from vllm_ascend.core import kv_cache_config_builder
 
     target = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32)
     draft = replace(target, non_causal_multi_token_decode=True)
@@ -174,12 +175,14 @@ def test_joint_prefix_group_ownership_survives_scheduler_conversion_and_empty_pp
     )
     original_groups = copy.deepcopy(kv_config.kv_cache_groups)
     with (
-        patch.object(patch_kv_cache_utils, "is_deepseek_v41_cache", return_value=False),
-        patch.object(patch_kv_cache_utils, "_get_glm5_next_cache_layout", return_value=None),
-        patch.object(patch_kv_cache_utils, "_is_deepseek_v4_groups", return_value=False),
-        patch.object(patch_kv_cache_utils, "_orig_get_kv_cache_config_from_groups", return_value=kv_config),
+        patch.object(kv_cache_config_builder, "is_deepseek_v41_cache", return_value=False),
+        patch.object(kv_cache_config_builder, "_get_glm5_next_cache_layout", return_value=None),
+        patch.object(kv_cache_config_builder, "_is_turboquant_or_deepseek_v4_groups", return_value=False),
+        patch.object(DefaultKVCacheConfigBuilder, "get_kv_cache_config_from_groups", return_value=kv_config),
     ):
-        result = patch_kv_cache_utils._ascend_get_kv_cache_config_from_groups(config, kv_config.kv_cache_groups, 0)
+        result = kv_cache_config_builder.AscendKVCacheConfigBuilder().get_kv_cache_config_from_groups(
+            config, kv_config.kv_cache_groups, 0
+        )
     assert result.dspark_draft_only_group_ids == (0,)
     scheduler_config = generate_scheduler_kv_cache_config([result])
     assert scheduler_config.dspark_draft_only_group_ids == (0,)

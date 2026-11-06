@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend.core.kv_cache_interface import (
     is_prefix_cacheable,
+    uses_large_page_allocator,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
@@ -109,6 +110,11 @@ def _ascend_resolve_kv_cache_block_sizes(
     For multiple KV cache groups with DCP, compute scheduler_block_size as
     lcm(group_block_sizes) * dcp to maintain alignment.
     """
+    if uses_large_page_allocator(vllm_config.cache_config):
+        # The large-page planner fixes hash_block_size at the global block
+        # size; the LCM/GCD split below is the uniform-page contract.
+        return _orig_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
@@ -631,6 +637,8 @@ def _ascend_pool_bytes_per_block(  # type: ignore[misc]
     layout, so using the upstream value changes ``num_blocks`` during the
     re-plan and leaves ranks inconsistent.
     """
+    if uses_large_page_allocator(vllm_config.cache_config):
+        return _orig_pool_bytes_per_block(vllm_config, kv_cache_groups)
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.pool_bytes_per_block(kv_cache_groups)
     if is_deepseek_v41_cache(kv_cache_groups):
@@ -656,6 +664,8 @@ def _ascend_max_memory_usage_bytes_from_groups(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
     """Keep Ascend admission accounting with the upstream builder API."""
+    if uses_large_page_allocator(vllm_config.cache_config):
+        return _orig_max_memory_usage_bytes_from_groups(builder, vllm_config, kv_cache_groups)
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
@@ -686,6 +696,11 @@ def _get_ascend_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
+    if uses_large_page_allocator(vllm_config.cache_config):
+        # The large-page planner forms one group per spec and lets pages change
+        # owners at run time; the layouts below assume a block ID spans layers
+        # whose specs differ, which is exactly what it removes.
+        return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
     groups = get_qwen4_exp_kv_cache_groups(vllm_config, kv_cache_spec, _orig_get_kv_cache_groups)
@@ -709,12 +724,15 @@ def _ascend_get_kv_cache_config_from_groups(
     ``copy.deepcopy`` in ``generate_scheduler_kv_cache_config`` and is
     dropped by worker pickle IPC, which never reads it.
     """
+    large_page = uses_large_page_allocator(vllm_config.cache_config)
     qwen_config = (
         None
-        if vllm_version_is("0.28.0")
+        if large_page or vllm_version_is("0.28.0")
         else get_qwen4_exp_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     )
-    if qwen_config is not None:
+    if large_page:
+        kv_cache_config = _orig_get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memory)
+    elif qwen_config is not None:
         kv_cache_config = qwen_config
     elif is_deepseek_v41_cache(kv_cache_groups):
         kv_cache_config = get_deepseek_v41_kv_cache_config(vllm_config, kv_cache_groups, available_memory)

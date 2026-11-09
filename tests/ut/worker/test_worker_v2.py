@@ -86,7 +86,6 @@ def test_triton_warmup_failure_prevents_capture(use_v2):
 class TestNPUWorkerV2(TestBase):
     def test_worker_imports_planning_helpers_from_supported_lane(self):
         from vllm.v1.core import kv_cache_planning as planning
-
         from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
 
         from vllm_ascend.worker import worker

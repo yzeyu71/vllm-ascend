@@ -121,6 +121,7 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
 )
 
+
 # Both supported versions resolve grouping through the platform's builder.
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
